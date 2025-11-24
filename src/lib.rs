@@ -102,7 +102,7 @@ impl Vault {
     /// Create a new vault (fails if already exists)
     pub fn create<P: AsRef<Path>>(path: P, password: &mut SecretString, vault_name: &str) -> Result<Self, VaultError> {
         let mut path_buf = path.as_ref().to_path_buf();
-        path_buf.set_file_name(vault_name);
+        path_buf.push(vault_name);
         
         if path_buf.exists() {
             return Err(VaultError::InvalidFormat(
@@ -141,7 +141,7 @@ impl Vault {
     /// Open an existing vault
     pub fn open<P: AsRef<Path>>(path: P, password: &mut SecretString, vault_name: &str) -> Result<Self, VaultError> {
         let mut path_buf = path.as_ref().to_path_buf();
-        path_buf.set_file_name(vault_name);
+        path_buf.push(vault_name);
         path_buf.set_extension("vault");
         if !path_buf.exists() {
             return Err(VaultError::VaultNotFound(path_buf.display().to_string()));
