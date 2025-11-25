@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use ark_std::rand::RngCore;
-use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretSlice, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretSlice, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, DirEntry};
@@ -19,7 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 use thiserror::Error;
 
 // ============================================================================
-// Error Types - Production error handling
+// Error Types
 // ============================================================================
 
 #[derive(Error, Debug)]
@@ -27,8 +27,11 @@ pub enum VaultError {
     #[error("Vault not found at path: {0}")]
     VaultNotFound(String),
     
-    #[error("Invalid password")]
-    InvalidPassword,
+    #[error("Invalid master password")]
+    InvalidMasterPassword,
+    
+    #[error("Invalid entry password")]
+    InvalidEntryPassword,
     
     #[error("Entry '{0}' not found")]
     EntryNotFound(String),
@@ -53,38 +56,49 @@ pub enum VaultError {
 // Data Structures
 // ============================================================================
 
-/// Each entry file is self-contained with its own encryption parameters
+/// Each entry has TWO layers of encryption:
+/// 1. Master password layer (outer) - proves you have vault access
+/// 2. Entry password layer (inner) - proves you have entry access
 #[derive(Serialize, Deserialize)]
 struct EntryFile {
     version: u32,
-    /// Unique salt for this specific entry
-    salt: String,
-    /// Password verification hash for this entry
-    verification: String,
-    /// The encrypted data
-    data: Vec<u8>,
-    /// Nonce used for encryption
-    nonce: [u8; 12],
-    /// Entry metadata
+    
+    // Master password layer
+    master_salt: String,
+    master_verification: String,
+    master_encrypted_data: Vec<u8>,
+    master_nonce: [u8; 12],
+    
+    // Entry metadata (not encrypted)
     created_at: u64,
     #[serde(default)]
     accessed_at: Option<u64>,
 }
 
-/// Vault metadata stored in config file
-#[derive(Serialize, Deserialize, Default)]
+/// Inner layer - encrypted with entry-specific password
+#[derive(Serialize, Deserialize)]
+struct EntryInnerLayer {
+    entry_salt: String,
+    entry_verification: String,
+    entry_nonce: [u8; 12],
+    data: Vec<u8>,
+}
+
+/// Vault config with master password verification
+#[derive(Serialize, Deserialize)]
+struct VaultConfig {
+    version: u32,
+    master_salt: String,
+    master_verification: String,
+    #[serde(default)]
+    metadata: VaultMetadata,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct VaultMetadata {
     created_at: u64,
     modified_at: u64,
     access_count: u64,
-}
-
-/// Simple config file - just metadata, no cryptographic material
-#[derive(Serialize, Deserialize)]
-struct VaultConfig {
-    version: u32,
-    #[serde(default)]
-    metadata: VaultMetadata,
 }
 
 // ============================================================================
@@ -93,7 +107,9 @@ struct VaultConfig {
 
 pub struct Vault {
     path: PathBuf,
-    password: SecretString,
+    // NO PASSWORD STORED - must be provided for each operation
+    master_salt: String,
+    master_verification: String,
     metadata: VaultMetadata,
     metadata_dirty: bool,
 }
@@ -103,10 +119,9 @@ impl Vault {
     const CONFIG_FILE: &'static str = ".vault_config";
     const ENTRY_EXTENSION: &'static str = "ventry";
     
-    /// Create a new vault directory (fails if already exists)
-    pub fn create<P: AsRef<Path>>(path: P, password: &mut SecretString) -> Result<Self, VaultError> {
+    /// Create a new vault with a master password
+    pub fn create<P: AsRef<Path>>(path: P, master_password: &mut SecretString) -> Result<Self, VaultError> {
         let vault_dir = path.as_ref().to_path_buf();
-
         let mut vault_config_file = vault_dir.clone();
         vault_config_file.push(Self::CONFIG_FILE);
         
@@ -116,11 +131,15 @@ impl Vault {
             ));
         }
         
-        Self::validate_password(&mut password.clone())?;
+        Self::validate_password(master_password)?;
         
         // Create vault directory
         fs::create_dir_all(&vault_dir)?;
         Self::set_secure_permissions(&vault_dir)?;
+        
+        // Generate master salt and verification
+        let master_salt = SaltString::generate(&mut Argon2Rng);
+        let master_verification = Self::create_verification(master_password, &master_salt)?;
         
         let now = Self::timestamp();
         let metadata = VaultMetadata {
@@ -129,21 +148,48 @@ impl Vault {
             access_count: 0,
         };
         
-        let vault = Self {
-            path: vault_dir,
-            password: password.clone(),
-            metadata,
-            metadata_dirty: true,
+        let config = VaultConfig {
+            version: Self::CURRENT_VERSION,
+            master_salt: master_salt.to_string(),
+            master_verification: master_verification.clone(),
+            metadata: metadata.clone(),
         };
         
-        vault.save_config()?;
-        password.zeroize();
+        // Save config
+        let json = serde_json::to_string_pretty(&config)
+            .context("Failed to serialize vault config")
+            .map_err(|e| VaultError::InvalidFormat(e.to_string()))?;
         
-        Ok(vault)
+        let config_path = vault_dir.join(Self::CONFIG_FILE);
+        let mut file = File::create(&config_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        Self::set_secure_permissions(&config_path)?;
+        
+        master_password.zeroize();
+        
+        Ok(Self {
+            path: vault_dir,
+            master_salt: master_salt.to_string(),
+            master_verification,
+            metadata,
+            metadata_dirty: true,
+        })
+    }
+
+    pub fn open_or_create<P: AsRef<Path>>(path: P, master_password: &mut SecretString) -> Result<Self, VaultError>{
+        let vault_dir = path.as_ref().to_path_buf();
+        let mut vault_config_file = vault_dir.clone();
+        vault_config_file.push(Self::CONFIG_FILE);
+        if !vault_config_file.exists() {
+            Self::create(path, master_password)
+        } else {
+            Self::open(path, master_password)
+        }
     }
     
-    /// Open an existing vault directory
-    pub fn open<P: AsRef<Path>>(path: P, password: &mut SecretString) -> Result<Self, VaultError> {
+    /// Open existing vault - verifies master password but doesn't store it
+    pub fn open<P: AsRef<Path>>(path: P, master_password: &mut SecretString) -> Result<Self, VaultError> {
         let vault_dir = path.as_ref().to_path_buf();
         let mut config_file = vault_dir.clone();
         config_file.push(Self::CONFIG_FILE);
@@ -153,9 +199,8 @@ impl Vault {
         }
         
         Self::verify_permissions(&vault_dir)?;
-        Self::validate_password(&mut password.clone())?;
         
-        // Read config file
+        // Read config
         let config_path = vault_dir.join(Self::CONFIG_FILE);
         let data = fs::read_to_string(&config_path)
             .context("Failed to read vault config file")
@@ -171,68 +216,103 @@ impl Vault {
             ));
         }
         
+        // Verify master password
+        let master_verification = PasswordHash::new(&config.master_verification)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid verification: {}", e)))?;
+        
+        Argon2::default()
+            .verify_password(master_password.expose_secret().as_bytes(), &master_verification)
+            .map_err(|_| VaultError::InvalidMasterPassword)?;
+        
+        master_password.zeroize();
+        
         let mut metadata = config.metadata;
         metadata.access_count += 1;
         
         Ok(Self {
             path: vault_dir,
-            password: password.clone(),
+            master_salt: config.master_salt,
+            master_verification: config.master_verification,
             metadata,
             metadata_dirty: true,
         })
     }
     
-    /// Create or open a vault
-    pub fn open_or_create<P: AsRef<Path>>(path: P, password: &mut SecretString) -> Result<Self, VaultError> {
-        let vault_dir = path.as_ref().to_path_buf();
-
-        let mut vault_config_file = vault_dir.clone();
-        vault_config_file.push(Self::CONFIG_FILE);
-        
-        if vault_config_file.exists() {
-            Self::open(vault_dir, password)
-        } else {
-            Self::create(vault_dir, password)
-        }
-    }
-    
-    /// Store raw bytes as a separate encrypted file with unique salt
-    pub fn store_bytes(&mut self, name: &str, data: &[u8]) -> Result<(), VaultError> {
+    /// Store data with two-layer encryption
+    /// Requires both master password (proves vault access) and entry password (for this specific entry)
+    pub fn store_bytes(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        master_password: &mut SecretString,
+        entry_password: &mut SecretString,
+    ) -> Result<(), VaultError> {
         Self::validate_entry_name(name)?;
+        Self::validate_password(entry_password)?;
         
-        // Generate unique salt for this entry
-        let salt = SaltString::generate(&mut Argon2Rng);
+        // Verify master password
+        let master_salt = SaltString::from_b64(&self.master_salt)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid master salt: {}", e)))?;
         
-        // Derive key specific to this entry
-        let key = Self::derive_key(&mut self.password.clone(), &salt)?;
+        let master_verification = PasswordHash::new(&self.master_verification)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid master verification: {}", e)))?;
         
-        // Create verification hash for this entry
-        let verification = Self::create_verification(&mut self.password.clone(), &salt)?;
+        Argon2::default()
+            .verify_password(master_password.expose_secret().as_bytes(), &master_verification)
+            .map_err(|_| VaultError::InvalidMasterPassword)?;
         
-        // Encrypt with entry-specific key
-        let cipher = ChaCha20Poly1305::new_from_slice(&*key)
+        // LAYER 2: Encrypt with entry-specific password (inner layer)
+        let entry_salt = SaltString::generate(&mut Argon2Rng);
+        let entry_key = Self::derive_key(entry_password, &entry_salt)?;
+        let entry_verification = Self::create_verification(entry_password, &entry_salt)?;
+        
+        let entry_cipher = ChaCha20Poly1305::new_from_slice(&*entry_key)
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
         
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let mut entry_nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut entry_nonce_bytes);
+        let entry_nonce = Nonce::from_slice(&entry_nonce_bytes);
         
-        let encrypted = cipher
-            .encrypt(nonce, data)
+        let entry_encrypted = entry_cipher
+            .encrypt(entry_nonce, data)
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
         
-        // Create self-contained entry file
+        let inner_layer = EntryInnerLayer {
+            entry_salt: entry_salt.to_string(),
+            entry_verification: entry_verification.clone(),
+            entry_nonce: entry_nonce_bytes,
+            data: entry_encrypted,
+        };
+        
+        let inner_json = serde_json::to_vec(&inner_layer)
+            .context("Failed to serialize inner layer")
+            .map_err(|e| VaultError::InvalidFormat(e.to_string()))?;
+        
+        // LAYER 1: Encrypt inner layer with master password (outer layer)
+        let master_key = Self::derive_key(master_password, &master_salt)?;
+        let master_cipher = ChaCha20Poly1305::new_from_slice(&*master_key)
+            .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
+        
+        let mut master_nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut master_nonce_bytes);
+        let master_nonce = Nonce::from_slice(&master_nonce_bytes);
+        
+        let master_encrypted = master_cipher
+            .encrypt(master_nonce, inner_json.as_ref())
+            .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
+        
+        // Create entry file
         let entry_file = EntryFile {
             version: Self::CURRENT_VERSION,
-            salt: salt.to_string(),
-            verification: verification.to_string(),
-            data: encrypted,
-            nonce: nonce_bytes,
+            master_salt: self.master_salt.clone(),
+            master_verification: self.master_verification.clone(),
+            master_encrypted_data: master_encrypted,
+            master_nonce: master_nonce_bytes,
             created_at: Self::timestamp(),
             accessed_at: None,
         };
         
-        // Write entry to its own file
+        // Write to disk
         let entry_path = self.get_entry_path(name);
         let json = serde_json::to_string_pretty(&entry_file)
             .context("Failed to serialize entry")
@@ -241,8 +321,10 @@ impl Vault {
         let mut file = File::create(&entry_path)?;
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
-        
         Self::set_secure_permissions(&entry_path)?;
+        
+        master_password.zeroize();
+        entry_password.zeroize();
         
         self.metadata.modified_at = Self::timestamp();
         self.metadata_dirty = true;
@@ -250,20 +332,31 @@ impl Vault {
         Ok(())
     }
     
-    /// Store a string
-    pub fn store_string(&mut self, name: &str, text: &str) -> Result<(), VaultError> {
-        self.store_bytes(name, text.as_bytes())
+    /// Store string with two passwords
+    pub fn store_string(
+        &mut self,
+        name: &str,
+        text: &str,
+        master_password: &mut SecretString,
+        entry_password: &mut SecretString,
+    ) -> Result<(), VaultError> {
+        self.store_bytes(name, text.as_bytes(), master_password, entry_password)
     }
     
-    /// Retrieve and decrypt data from file using its own salt/verification
-    pub fn get(&mut self, name: &str) -> Result<SecretBox<[u8]>, VaultError> {
+    /// Retrieve data - requires BOTH passwords
+    pub fn get(
+        &mut self,
+        name: &str,
+        master_password: &mut SecretString,
+        entry_password: &mut SecretString,
+    ) -> Result<SecretBox<[u8]>, VaultError> {
         let entry_path = self.get_entry_path(name);
         
         if !entry_path.exists() {
             return Err(VaultError::EntryNotFound(name.to_string()));
         }
         
-        // Read encrypted entry from file
+        // Read entry file
         let data = fs::read_to_string(&entry_path)
             .context("Failed to read entry file")
             .map_err(|_| VaultError::DecryptionFailed)?;
@@ -278,28 +371,50 @@ impl Vault {
             ));
         }
         
-        // Parse this entry's salt and verification
-        let salt = SaltString::from_b64(&entry_file.salt)
-            .map_err(|e| VaultError::InvalidFormat(format!("Invalid salt: {}", e)))?;
+        // Verify master password
+        let master_salt = SaltString::from_b64(&self.master_salt)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid master salt: {}", e)))?;
         
-        let verification = PasswordHash::new(&entry_file.verification)
-            .map_err(|e| VaultError::InvalidFormat(format!("Invalid verification: {}", e)))?;
+        let master_verification = PasswordHash::new(&self.master_verification)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid master verification: {}", e)))?;
         
-        // Verify password against this entry's verification hash
         Argon2::default()
-            .verify_password(self.password.expose_secret().as_bytes(), &verification)
-            .map_err(|_| VaultError::InvalidPassword)?;
+            .verify_password(master_password.expose_secret().as_bytes(), &master_verification)
+            .map_err(|_| VaultError::InvalidMasterPassword)?;
         
-        // Derive key specific to this entry
-        let key = Self::derive_key(&mut self.password.clone(), &salt)?;
-        
-        let cipher = ChaCha20Poly1305::new_from_slice(&*key)
+        // LAYER 1: Decrypt outer layer with master password
+        let master_key = Self::derive_key(master_password, &master_salt)?;
+        let master_cipher = ChaCha20Poly1305::new_from_slice(&*master_key)
             .map_err(|_| VaultError::DecryptionFailed)?;
         
-        let nonce = Nonce::from_slice(&entry_file.nonce);
+        let master_nonce = Nonce::from_slice(&entry_file.master_nonce);
+        let inner_json = master_cipher
+            .decrypt(master_nonce, entry_file.master_encrypted_data.as_ref())
+            .map_err(|_| VaultError::DecryptionFailed)?;
         
-        let decrypted = cipher
-            .decrypt(nonce, entry_file.data.as_ref())
+        let inner_layer: EntryInnerLayer = serde_json::from_slice(&inner_json)
+            .context("Failed to parse inner layer")
+            .map_err(|_| VaultError::DecryptionFailed)?;
+        
+        // Verify entry password
+        let entry_salt = SaltString::from_b64(&inner_layer.entry_salt)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid entry salt: {}", e)))?;
+        
+        let entry_verification = PasswordHash::new(&inner_layer.entry_verification)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid entry verification: {}", e)))?;
+        
+        Argon2::default()
+            .verify_password(entry_password.expose_secret().as_bytes(), &entry_verification)
+            .map_err(|_| VaultError::InvalidEntryPassword)?;
+        
+        // LAYER 2: Decrypt inner layer with entry password
+        let entry_key = Self::derive_key(entry_password, &entry_salt)?;
+        let entry_cipher = ChaCha20Poly1305::new_from_slice(&*entry_key)
+            .map_err(|_| VaultError::DecryptionFailed)?;
+        
+        let entry_nonce = Nonce::from_slice(&inner_layer.entry_nonce);
+        let decrypted = entry_cipher
+            .decrypt(entry_nonce, inner_layer.data.as_ref())
             .map_err(|_| VaultError::DecryptionFailed)?;
         
         // Update access time
@@ -312,22 +427,30 @@ impl Vault {
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
         
+        master_password.zeroize();
+        entry_password.zeroize();
+        
         Ok(SecretSlice::new(decrypted.into()))
     }
     
     /// Retrieve as string
-    pub fn get_string(&mut self, name: &str) -> Result<String, VaultError> {
-        let data = self.get(name)?;
+    pub fn get_string(
+        &mut self,
+        name: &str,
+        master_password: &mut SecretString,
+        entry_password: &mut SecretString,
+    ) -> Result<String, VaultError> {
+        let data = self.get(name, master_password, entry_password)?;
         String::from_utf8(data.expose_secret().to_vec())
             .map_err(|e| VaultError::InvalidFormat(format!("Not valid UTF-8: {}", e)))
     }
     
-    /// Check if entry exists
+    /// Check if entry exists (no password needed)
     pub fn contains(&self, name: &str) -> bool {
         self.get_entry_path(name).exists()
     }
     
-    /// List all entry names by reading directory
+    /// List all entries (no password needed)
     pub fn list(&self) -> Vec<String> {
         let mut entries = Vec::new();
         
@@ -343,8 +466,17 @@ impl Vault {
         entries
     }
     
-    /// Delete an entry file
-    pub fn delete(&mut self, name: &str) -> Result<(), VaultError> {
+    /// Delete entry (requires master password)
+    pub fn delete(&mut self, name: &str, master_password: &mut SecretString) -> Result<(), VaultError> {
+        
+        // Verify master password
+        let master_verification = PasswordHash::new(&self.master_verification)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid master verification: {}", e)))?;
+        
+        Argon2::default()
+            .verify_password(master_password.expose_secret().as_bytes(), &master_verification)
+            .map_err(|_| VaultError::InvalidMasterPassword)?;
+        
         let entry_path = self.get_entry_path(name);
         
         if !entry_path.exists() {
@@ -353,103 +485,78 @@ impl Vault {
         
         fs::remove_file(entry_path)?;
         
+        master_password.zeroize();
         self.metadata.modified_at = Self::timestamp();
         self.metadata_dirty = true;
         
         Ok(())
     }
     
-    /// Get entry metadata without decrypting
-    pub fn get_metadata(&self, name: &str) -> Option<EntryInfo> {
-        let entry_path = self.get_entry_path(name);
+    /// Change master password - re-encrypts all outer layers
+    pub fn change_master_password(
+        &mut self,
+        old_master: &mut SecretString,
+        new_master: &mut SecretString,
+    ) -> Result<(), VaultError> {
+        Self::validate_password(new_master)?;
         
-        if !entry_path.exists() {
-            return None;
-        }
+        // Verify old master password
+        let old_master_salt = SaltString::from_b64(&self.master_salt)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid master salt: {}", e)))?;
         
-        let data = fs::read_to_string(&entry_path).ok()?;
-        let entry: EntryFile = serde_json::from_str(&data).ok()?;
+        let old_master_verification = PasswordHash::new(&self.master_verification)
+            .map_err(|e| VaultError::InvalidFormat(format!("Invalid master verification: {}", e)))?;
         
-        Some(EntryInfo {
-            name: name.to_string(),
-            created_at: entry.created_at,
-            accessed_at: entry.accessed_at,
-            size: entry.data.len(),
-        })
-    }
-    
-    /// Change vault password - re-encrypts all entry files with new unique salts
-    pub fn change_password(&mut self, old_password: &mut SecretString, new_password: &mut SecretString) -> Result<(), VaultError> {
-        Self::validate_password(&mut new_password.clone())?;
+        Argon2::default()
+            .verify_password(old_master.expose_secret().as_bytes(), &old_master_verification)
+            .map_err(|_| VaultError::InvalidMasterPassword)?;
         
         let entries = self.list();
         
-        // Verify old password works on at least one entry (if any exist)
-        if !entries.is_empty() {
-            let test_entry_path = self.get_entry_path(&entries[0]);
-            let data = fs::read_to_string(&test_entry_path)?;
-            let test_file: EntryFile = serde_json::from_str(&data)
-                .map_err(|_| VaultError::DecryptionFailed)?;
-            
-            let salt = SaltString::from_b64(&test_file.salt)
-                .map_err(|e| VaultError::InvalidFormat(format!("Invalid salt: {}", e)))?;
-            let verification = PasswordHash::new(&test_file.verification)
-                .map_err(|e| VaultError::InvalidFormat(format!("Invalid verification: {}", e)))?;
-            
-            Argon2::default()
-                .verify_password(old_password.expose_secret().as_bytes(), &verification)
-                .map_err(|_| VaultError::InvalidPassword)?;
-        }
+        // Generate new master salt and verification
+        let new_master_salt = SaltString::generate(&mut Argon2Rng);
+        let new_master_verification = Self::create_verification(new_master, &new_master_salt)?;
         
-        old_password.zeroize();
-        
-        // Re-encrypt each entry with new password and NEW unique salt
+        // Re-encrypt each entry's outer layer
         for name in entries {
             let entry_path = self.get_entry_path(&name);
             let data = fs::read_to_string(&entry_path)?;
             let old_entry: EntryFile = serde_json::from_str(&data)
                 .map_err(|_| VaultError::DecryptionFailed)?;
             
-            // Decrypt with old entry's key
-            let old_salt = SaltString::from_b64(&old_entry.salt)
-                .map_err(|e| VaultError::InvalidFormat(format!("Invalid salt: {}", e)))?;
-            let old_key = Self::derive_key(&mut self.password.clone(), &old_salt)?;
-            let old_cipher = ChaCha20Poly1305::new_from_slice(&*old_key)
+            // Decrypt outer layer with old master
+            let old_master_key = Self::derive_key(old_master, &old_master_salt)?;
+            let old_cipher = ChaCha20Poly1305::new_from_slice(&*old_master_key)
                 .map_err(|_| VaultError::DecryptionFailed)?;
             
-            let nonce = Nonce::from_slice(&old_entry.nonce);
-            let decrypted = old_cipher
-                .decrypt(nonce, old_entry.data.as_ref())
+            let nonce = Nonce::from_slice(&old_entry.master_nonce);
+            let inner_json = old_cipher
+                .decrypt(nonce, old_entry.master_encrypted_data.as_ref())
                 .map_err(|_| VaultError::DecryptionFailed)?;
             
-            // Generate NEW unique salt for this entry with new password
-            let new_salt = SaltString::generate(&mut Argon2Rng);
-            let new_key = Self::derive_key(&mut new_password.clone(), &new_salt)?;
-            let new_verification = Self::create_verification(&mut new_password.clone(), &new_salt)?;
-            
-            // Encrypt with new key
-            let new_cipher = ChaCha20Poly1305::new_from_slice(&*new_key)
+            // Re-encrypt with new master password
+            let new_master_key = Self::derive_key(new_master, &new_master_salt)?;
+            let new_cipher = ChaCha20Poly1305::new_from_slice(&*new_master_key)
                 .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
             
             let mut new_nonce_bytes = [0u8; 12];
             OsRng.fill_bytes(&mut new_nonce_bytes);
             let new_nonce = Nonce::from_slice(&new_nonce_bytes);
             
-            let encrypted = new_cipher
-                .encrypt(new_nonce, decrypted.as_ref())
+            let new_encrypted = new_cipher
+                .encrypt(new_nonce, inner_json.as_ref())
                 .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
             
             let new_entry = EntryFile {
                 version: Self::CURRENT_VERSION,
-                salt: new_salt.to_string(),
-                verification: new_verification.to_string(),
-                data: encrypted,
-                nonce: new_nonce_bytes,
+                master_salt: new_master_salt.to_string(),
+                master_verification: new_master_verification.clone(),
+                master_encrypted_data: new_encrypted,
+                master_nonce: new_nonce_bytes,
                 created_at: old_entry.created_at,
                 accessed_at: old_entry.accessed_at,
             };
             
-            // Write re-encrypted entry back to file
             let json = serde_json::to_string_pretty(&new_entry)
                 .map_err(|e| VaultError::InvalidFormat(e.to_string()))?;
             
@@ -458,10 +565,14 @@ impl Vault {
             file.sync_all()?;
         }
         
-        // Update vault password
-        self.password = new_password.clone();
-        new_password.zeroize();
+        // Update vault config
+        self.master_salt = new_master_salt.to_string();
+        self.master_verification = new_master_verification;
+        
+        old_master.zeroize();
+        new_master.zeroize();
         self.metadata_dirty = true;
+        self.save_config()?;
         
         Ok(())
     }
@@ -470,6 +581,8 @@ impl Vault {
     fn save_config(&self) -> Result<(), VaultError> {
         let config = VaultConfig {
             version: Self::CURRENT_VERSION,
+            master_salt: self.master_salt.clone(),
+            master_verification: self.master_verification.clone(),
             metadata: VaultMetadata {
                 created_at: self.metadata.created_at,
                 modified_at: Self::timestamp(),
@@ -502,12 +615,10 @@ impl Vault {
     fn entry_name_from_path(entry: &DirEntry) -> Option<String> {
         let path = entry.path();
         
-        // Skip config file
         if path.file_name()? == Self::CONFIG_FILE {
             return None;
         }
         
-        // Check extension
         if path.extension()? != Self::ENTRY_EXTENSION {
             return None;
         }
@@ -523,8 +634,6 @@ impl Vault {
         let argon2 = Argon2::default();
         let hash = argon2.hash_password(password.expose_secret().as_bytes(), salt)
             .map_err(|e| VaultError::EncryptionFailed(format!("Key derivation failed: {}", e)))?;
-
-        password.zeroize();
         
         let hash_bytes = hash.hash
             .ok_or_else(|| VaultError::EncryptionFailed("No hash generated".to_string()))?;
@@ -535,24 +644,20 @@ impl Vault {
         Ok(key)
     }
     
-    fn create_verification(password: &mut SecretString, salt: &SaltString) -> Result<String, VaultError> {
+    fn create_verification(password: &SecretString, salt: &SaltString) -> Result<String, VaultError> {
         let argon2 = Argon2::default();
         let hash = argon2.hash_password(password.expose_secret().as_bytes(), salt)
             .map_err(|e| VaultError::EncryptionFailed(format!("Verification failed: {}", e)))?;
-        password.zeroize();
-
-        let hash_string = hash.to_string();
         
-        Ok(hash_string)
+        Ok(hash.to_string())
     }
     
-    fn validate_password(password: &mut SecretString) -> Result<(), VaultError> {
+    fn validate_password(password: &SecretString) -> Result<(), VaultError> {
         if password.expose_secret().len() < 8 {
             return Err(VaultError::InvalidFormat(
                 "Password must be at least 8 characters".to_string()
             ));
         }
-        password.zeroize();
         Ok(())
     }
     
@@ -580,9 +685,9 @@ impl Vault {
         let mut permissions = metadata.permissions();
         
         if metadata.is_dir() {
-            permissions.set_mode(0o700); // rwx------
+            permissions.set_mode(0o700);
         } else {
-            permissions.set_mode(0o600); // rw-------
+            permissions.set_mode(0o600);
         }
         
         fs::set_permissions(path, permissions)?;
@@ -591,7 +696,6 @@ impl Vault {
     
     #[cfg(not(unix))]
     fn set_secure_permissions(_path: &Path) -> Result<(), VaultError> {
-        // On Windows, use ACLs in production
         Ok(())
     }
     
@@ -621,7 +725,6 @@ impl Vault {
     }
 }
 
-// Auto-save config on drop
 impl Drop for Vault {
     fn drop(&mut self) {
         if self.metadata_dirty {
