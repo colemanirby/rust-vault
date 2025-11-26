@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use ark_std::rand::RngCore;
 use secrecy::{ExposeSecret, SecretBox, SecretSlice, SecretString};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::{self, File, DirEntry};
-use std::io::{Write, Read};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use argon2::{
@@ -94,7 +93,7 @@ struct VaultConfig {
     metadata: VaultMetadata,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 struct VaultMetadata {
     created_at: u64,
     modified_at: u64,
@@ -104,7 +103,7 @@ struct VaultMetadata {
 // ============================================================================
 // Main Vault Implementation
 // ============================================================================
-
+#[derive(Clone, Debug)]
 pub struct Vault {
     path: PathBuf,
     // NO PASSWORD STORED - must be provided for each operation
@@ -468,7 +467,7 @@ impl Vault {
     
     /// Delete entry (requires master password)
     pub fn delete(&mut self, name: &str, master_password: &mut SecretString) -> Result<(), VaultError> {
-        
+
         // Verify master password
         let master_verification = PasswordHash::new(&self.master_verification)
             .map_err(|e| VaultError::InvalidFormat(format!("Invalid master verification: {}", e)))?;
