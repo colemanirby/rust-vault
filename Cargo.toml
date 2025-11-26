@@ -1,5 +1,5 @@
 [package]
-authors = ["Coleman <coleman@idealabs.network>"]
+authors = ["Coleman <ckirbyee92@gmail.com>"]
 name = "rust-vault"
 version = "0.1.0"
 edition = "2024"
