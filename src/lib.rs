@@ -743,3 +743,589 @@ pub struct EntryInfo {
     pub accessed_at: Option<u64>,
     pub size: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    // Helper function to create test passwords
+    fn test_master_password() -> SecretString {
+        SecretString::new(String::from("master_password_123").into_boxed_str())
+    }
+
+    fn test_entry_password() -> SecretString {
+        SecretString::new(String::from("entry_password_456").into_boxed_str())
+    }
+
+    fn weak_password() -> SecretString {
+        SecretString::new(String::from("weak").into_boxed_str())
+    }
+
+    fn wrong_password() -> SecretString {
+        SecretString::new(String::from("wrong_password123").into_boxed_str())
+    }
+
+    fn temp_vault_dir() -> TempDir {
+        TempDir::new().expect("Failed to create temp directory")
+    }
+
+    #[test]
+    fn test_create_new_vault() {
+        let dir = temp_vault_dir();
+        let mut master = test_master_password();
+        
+        let vault = Vault::create(dir.path(), &mut master);
+        
+        assert!(vault.is_ok());
+        assert!(dir.path().join(".vault_config").exists());
+    }
+
+    #[test]
+    fn test_create_vault_with_weak_password() {
+        let dir = temp_vault_dir();
+        let mut weak = weak_password();
+        
+        let result = Vault::create(dir.path(), &mut weak);
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn test_create_vault_twice_fails() {
+        let dir = temp_vault_dir();
+        let mut master1 = test_master_password();
+        let mut master2 = test_master_password();
+        
+        Vault::create(dir.path(), &mut master1).expect("First create failed");
+        let result = Vault::create(dir.path(), &mut master2);
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn test_open_existing_vault() {
+        let dir = temp_vault_dir();
+        let mut master1 = test_master_password();
+        let mut master2 = test_master_password();
+        
+        Vault::create(dir.path(), &mut master1).expect("Create failed");
+        let result = Vault::open(dir.path(), &mut master2);
+        
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_open_vault_wrong_password() {
+        let dir = temp_vault_dir();
+        let mut master1 = test_master_password();
+        let mut wrong = wrong_password();
+        
+        Vault::create(dir.path(), &mut master1).expect("Create failed");
+        let result = Vault::open(dir.path(), &mut wrong);
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidMasterPassword));
+    }
+
+    #[test]
+    fn test_open_nonexistent_vault() {
+        let dir = temp_vault_dir();
+        let mut master = test_master_password();
+        
+        let result = Vault::open(dir.path().join("nonexistent"), &mut master);
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::VaultNotFound(_)));
+    }
+
+    #[test]
+    fn test_open_or_create_new() {
+        let dir = temp_vault_dir();
+        let mut master = test_master_password();
+        
+        let result = Vault::open_or_create(dir.path(), &mut master);
+        
+        assert!(result.is_ok());
+        assert!(dir.path().join(".vault_config").exists());
+    }
+
+    #[test]
+    fn test_open_or_create_existing() {
+        let dir = temp_vault_dir();
+        let mut master1 = test_master_password();
+        let mut master2 = test_master_password();
+        
+        Vault::create(dir.path(), &mut master1).expect("Create failed");
+        let result = Vault::open_or_create(dir.path(), &mut master2);
+        
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_store_and_retrieve_bytes() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let data = b"secret data";
+        vault.store_bytes(
+            "test_entry",
+            data,
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Store failed");
+        
+        let retrieved = vault.get(
+            "test_entry",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Get failed");
+        
+        assert_eq!(retrieved.expose_secret(), data);
+    }
+
+    #[test]
+    fn test_store_and_retrieve_string() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let text = "This is a secret message!";
+        vault.store_string(
+            "message",
+            text,
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Store failed");
+        
+        let retrieved = vault.get_string(
+            "message",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Get failed");
+        
+        assert_eq!(retrieved, text);
+    }
+
+    #[test]
+    fn test_retrieve_with_wrong_master_password() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        vault.store_string(
+            "entry",
+            "data",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Store failed");
+        
+        let result = vault.get_string(
+            "entry",
+            &mut wrong_password(),
+            &mut test_entry_password(),
+        );
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidMasterPassword));
+    }
+
+    #[test]
+    fn test_retrieve_with_wrong_entry_password() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        vault.store_string(
+            "entry",
+            "data",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Store failed");
+        
+        let result = vault.get_string(
+            "entry",
+            &mut test_master_password(),
+            &mut wrong_password(),
+        );
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidEntryPassword));
+    }
+
+    #[test]
+    fn test_retrieve_nonexistent_entry() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let result = vault.get_string(
+            "nonexistent",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        );
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::EntryNotFound(_)));
+    }
+
+    #[test]
+    fn test_multiple_entries_different_passwords() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let entry1_pass = SecretString::new(String::from("entry1_password_123").into_boxed_str());
+        let entry2_pass = SecretString::new(String::from("entry2_password_456").into_boxed_str());
+        
+        vault.store_string(
+            "entry1",
+            "data1",
+            &mut test_master_password(),
+            &mut entry1_pass.clone(),
+        ).expect("Store entry1 failed");
+        
+        vault.store_string(
+            "entry2",
+            "data2",
+            &mut test_master_password(),
+            &mut entry2_pass.clone(),
+        ).expect("Store entry2 failed");
+        
+        let retrieved1 = vault.get_string(
+            "entry1",
+            &mut test_master_password(),
+            &mut entry1_pass.clone(),
+        ).expect("Get entry1 failed");
+        
+        let retrieved2 = vault.get_string(
+            "entry2",
+            &mut test_master_password(),
+            &mut entry2_pass.clone(),
+        ).expect("Get entry2 failed");
+        
+        assert_eq!(retrieved1, "data1");
+        assert_eq!(retrieved2, "data2");
+        
+        // Wrong password for entry1
+        let result = vault.get_string(
+            "entry1",
+            &mut test_master_password(),
+            &mut entry2_pass.clone(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_contains() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        assert!(!vault.contains("entry"));
+        
+        vault.store_string(
+            "entry",
+            "data",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Store failed");
+        
+        assert!(vault.contains("entry"));
+        assert!(!vault.contains("other"));
+    }
+
+    #[test]
+    fn test_list_entries() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        assert_eq!(vault.list().len(), 0);
+        
+        vault.store_string("entry1", "data1", &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        vault.store_string("entry2", "data2", &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        vault.store_string("entry3", "data3", &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        
+        let list = vault.list();
+        assert_eq!(list.len(), 3);
+        assert!(list.contains(&"entry1".to_string()));
+        assert!(list.contains(&"entry2".to_string()));
+        assert!(list.contains(&"entry3".to_string()));
+        
+        // Check sorted
+        assert_eq!(list, vec!["entry1", "entry2", "entry3"]);
+    }
+
+    #[test]
+    fn test_delete_entry() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        vault.store_string(
+            "entry",
+            "data",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Store failed");
+        
+        assert!(vault.contains("entry"));
+        
+        vault.delete("entry", &mut test_master_password())
+            .expect("Delete failed");
+        
+        assert!(!vault.contains("entry"));
+    }
+
+    #[test]
+    fn test_delete_with_wrong_password() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        vault.store_string(
+            "entry",
+            "data",
+            &mut test_master_password(),
+            &mut test_entry_password(),
+        ).expect("Store failed");
+        
+        let result = vault.delete(
+            "entry",
+            &mut wrong_password()
+        );
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidMasterPassword));
+        assert!(vault.contains("entry"));
+    }
+
+    #[test]
+    fn test_delete_nonexistent_entry() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let result = vault.delete("nonexistent", &mut test_master_password());
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::EntryNotFound(_)));
+    }
+
+    #[test]
+    fn test_change_master_password() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        // Store entries with different entry passwords
+        let entry1_pass = SecretString::new(String::from("entry1_pass_123").into_boxed_str());
+        let entry2_pass = SecretString::new(String::from("entry2_pass_456").into_boxed_str());
+        
+        vault.store_string("entry1", "data1", &mut test_master_password(), &mut entry1_pass.clone())
+            .expect("Store entry1 failed");
+        vault.store_string("entry2", "data2", &mut test_master_password(), &mut entry2_pass.clone())
+            .expect("Store entry2 failed");
+        
+        // Change master password
+        let new_master = SecretString::new(String::from("new_master_password_789").into_boxed_str());
+        vault.change_master_password(
+            &mut test_master_password(),
+            &mut new_master.clone(),
+        ).expect("Change password failed");
+        
+        // Old master password should not work
+        let result = vault.get_string("entry1", &mut test_master_password(), &mut entry1_pass.clone());
+        assert!(result.is_err());
+        
+        // New master password should work with original entry passwords
+        let data1 = vault.get_string("entry1", &mut new_master.clone(), &mut entry1_pass.clone())
+            .expect("Get entry1 failed");
+        let data2 = vault.get_string("entry2", &mut new_master.clone(), &mut entry2_pass.clone())
+            .expect("Get entry2 failed");
+        
+        assert_eq!(data1, "data1");
+        assert_eq!(data2, "data2");
+    }
+
+    #[test]
+    fn test_change_master_password_wrong_old_password() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let result = vault.change_master_password(
+            &mut wrong_password(),
+            &mut SecretString::new(String::from("new_password_123").into_boxed_str()),
+        );
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidMasterPassword));
+    }
+
+    #[test]
+    fn test_change_master_password_weak_new_password() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let result = vault.change_master_password(
+            &mut test_master_password(),
+            &mut weak_password(),
+        );
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VaultError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn test_invalid_entry_names() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        // Empty name
+        let result = vault.store_string("", "data", &mut test_master_password(), &mut test_entry_password());
+        assert!(result.is_err());
+        
+        // Name with slash
+        let result = vault.store_string("entry/with/slash", "data", &mut test_master_password(), &mut test_entry_password());
+        assert!(result.is_err());
+        
+        // Name with backslash
+        let result = vault.store_string("entry\\with\\backslash", "data", &mut test_master_password(), &mut test_entry_password());
+        assert!(result.is_err());
+        
+        // Name with dot
+        let result = vault.store_string("entry.with.dot", "data", &mut test_master_password(), &mut test_entry_password());
+        assert!(result.is_err());
+        
+        // Name with null byte
+        let result = vault.store_string("entry\0null", "data", &mut test_master_password(), &mut test_entry_password());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_overwrite_entry() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        vault.store_string("entry", "original", &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        
+        vault.store_string("entry", "updated", &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        
+        let data = vault.get_string("entry", &mut test_master_password(), &mut test_entry_password())
+            .expect("Get failed");
+        
+        assert_eq!(data, "updated");
+    }
+
+    #[test]
+    fn test_large_data() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let large_data = "x".repeat(1_000_000); // 1MB of data
+        
+        vault.store_string("large", &large_data, &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        
+        let retrieved = vault.get_string("large", &mut test_master_password(), &mut test_entry_password())
+            .expect("Get failed");
+        
+        assert_eq!(retrieved.len(), large_data.len());
+        assert_eq!(retrieved, large_data);
+    }
+
+    #[test]
+    fn test_vault_persistence() {
+        let dir = temp_vault_dir();
+        let path = dir.path().to_path_buf();
+        
+        // Create vault and store entry
+        {
+            let mut vault = Vault::create(&path, &mut test_master_password())
+                .expect("Create failed");
+            
+            vault.store_string("persistent", "data", &mut test_master_password(), &mut test_entry_password())
+                .expect("Store failed");
+        }
+        
+        // Reopen vault and verify entry exists
+        {
+            let mut vault = Vault::open(&path, &mut test_master_password())
+                .expect("Open failed");
+            
+            let data = vault.get_string("persistent", &mut test_master_password(), &mut test_entry_password())
+                .expect("Get failed");
+            
+            assert_eq!(data, "data");
+        }
+    }
+
+    #[test]
+    fn test_unicode_data() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let unicode_data = "Hello 世界 🌍 Привет مرحبا";
+        
+        vault.store_string("unicode", unicode_data, &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        
+        let retrieved = vault.get_string("unicode", &mut test_master_password(), &mut test_entry_password())
+            .expect("Get failed");
+        
+        assert_eq!(retrieved, unicode_data);
+    }
+
+    #[test]
+    fn test_binary_data() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let binary_data: Vec<u8> = (0..=255).collect();
+        
+        vault.store_bytes("binary", &binary_data, &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        
+        let retrieved = vault.get("binary", &mut test_master_password(), &mut test_entry_password())
+            .expect("Get failed");
+        
+        assert_eq!(retrieved.expose_secret(), binary_data.as_slice());
+    }
+
+    #[test]
+    fn test_metadata_updates() {
+        let dir = temp_vault_dir();
+        let mut vault = Vault::create(dir.path(), &mut test_master_password())
+            .expect("Create failed");
+        
+        let initial_access_count = vault.metadata.access_count;
+        
+        vault.store_string("entry", "data", &mut test_master_password(), &mut test_entry_password())
+            .expect("Store failed");
+        
+        // Drop and reopen to trigger metadata save
+        drop(vault);
+        
+        let vault = Vault::open(dir.path(), &mut test_master_password())
+            .expect("Open failed");
+        
+        assert!(vault.metadata.access_count > initial_access_count);
+    }
+}
