@@ -752,19 +752,19 @@ mod tests {
 
     // Helper function to create test passwords
     fn test_master_password() -> SecretString {
-        SecretString::new(String::from("master_password_123").into_boxed_str())
+        SecretString::new("master_password_123".into())
     }
 
     fn test_entry_password() -> SecretString {
-        SecretString::new(String::from("entry_password_456").into_boxed_str())
+        SecretString::new("entry_password_456".into())
     }
 
     fn weak_password() -> SecretString {
-        SecretString::new(String::from("weak").into_boxed_str())
+        SecretString::new("weak".into())
     }
 
     fn wrong_password() -> SecretString {
-        SecretString::new(String::from("wrong_password123").into_boxed_str())
+        SecretString::new("wrong_password123".into())
     }
 
     fn temp_vault_dir() -> TempDir {
@@ -979,8 +979,8 @@ mod tests {
         let mut vault = Vault::create(dir.path(), &mut test_master_password())
             .expect("Create failed");
         
-        let entry1_pass = SecretString::new(String::from("entry1_password_123").into_boxed_str());
-        let entry2_pass = SecretString::new(String::from("entry2_password_456").into_boxed_str());
+        let entry1_pass = SecretString::new("entry1_password_123".into());
+        let entry2_pass = SecretString::new("entry2_password_456".into());
         
         vault.store_string(
             "entry1",
@@ -1127,8 +1127,8 @@ mod tests {
             .expect("Create failed");
         
         // Store entries with different entry passwords
-        let entry1_pass = SecretString::new(String::from("entry1_pass_123").into_boxed_str());
-        let entry2_pass = SecretString::new(String::from("entry2_pass_456").into_boxed_str());
+        let entry1_pass = SecretString::new("entry1_pass_123".into());
+        let entry2_pass = SecretString::new("entry2_pass_456".into());
         
         vault.store_string("entry1", "data1", &mut test_master_password(), &mut entry1_pass.clone())
             .expect("Store entry1 failed");
@@ -1136,7 +1136,7 @@ mod tests {
             .expect("Store entry2 failed");
         
         // Change master password
-        let new_master = SecretString::new(String::from("new_master_password_789").into_boxed_str());
+        let new_master = SecretString::new("new_master_password_789".into());
         vault.change_master_password(
             &mut test_master_password(),
             &mut new_master.clone(),
@@ -1164,7 +1164,7 @@ mod tests {
         
         let result = vault.change_master_password(
             &mut wrong_password(),
-            &mut SecretString::new(String::from("new_password_123").into_boxed_str()),
+            &mut SecretString::new("new_password_123".into()),
         );
         
         assert!(result.is_err());
